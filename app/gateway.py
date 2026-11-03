@@ -69,3 +69,79 @@ async def fetch(request, url, params=None):
         raise HTTPException(502, "Upstream unavailable")
     return response
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/users")
+@app.get("/users/{user_id}")
+async def get_user(request: Request, user_id: str | None = None):
+    from urllib.parse import quote
+
+    subject = request.state.user_id
+    if user_id is not None and user_id != subject:
+        raise HTTPException(403, "Access denied")
+    response = await fetch(request, f"{USER_URL}/users/{quote(subject, safe='')}")
+    return Response(content=response.content, status_code=response.status_code,
+                    media_type="application/json")
+
+
+@app.get("/orders")
+async def get_orders(request: Request):
+    response = await fetch(request, f"{ORDER_URL}/orders",
+                           {"user_id": request.state.user_id})
+    return Response(content=response.content, status_code=response.status_code,
+                    media_type="application/json")
+
+
+
+@app.get("/dashboard")
+async def dashboard(request: Request):
+    from urllib.parse import quote
+
+    subject = request.state.user_id
+    user_response, order_response = await asyncio.gather(
+        fetch(request, f"{USER_URL}/users/{quote(subject, safe='')}"),
+        fetch(request, f"{ORDER_URL}/orders", {"user_id": subject}))
+    for response in (user_response, order_response):
+        if response.status_code != 200:
+            raise HTTPException(404 if response.status_code == 404 else 502,
+                                "Unable to aggregate upstream response")
+    try:
+        user_data, order_data = user_response.json(), order_response.json()
+    except ValueError:
+        raise HTTPException(502, "Invalid upstream JSON")
+    if not isinstance(user_data, dict) or not isinstance(order_data, list):
+        raise HTTPException(502, "Invalid upstream response shape")
+    return {"user": user_data, "orders": order_data}
+
+
+class AvatarRequest(BaseModel):
+    content_type: str = "image/png"
+
+
+
+@app.post("/users/me/avatar-upload-url")
+def avatar_upload_url(body: AvatarRequest, request: Request):
+    from urllib.parse import quote
+
+    extensions = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}
+    if body.content_type not in extensions:
+        raise HTTPException(400, "Only PNG, JPEG and WebP supported")
+    key = f"avatars/{quote(request.state.user_id, safe='')}/{uuid4()}.{extensions[body.content_type]}"
+    client = boto3.client(
+        "s3", endpoint_url=os.getenv("MINIO_PUBLIC_URL", "http://localhost:9000"),
+        aws_access_key_id=os.getenv("MINIO_ROOT_USER", "minioadmin"),
+        aws_secret_access_key=os.getenv("MINIO_ROOT_PASSWORD", "minioadmin123"),
+        region_name="us-east-1",
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
+    try:
+        url = client.generate_presigned_url(
+            "put_object", Params={"Bucket": os.getenv("MINIO_BUCKET", "avatars"),
+                                  "Key": key, "ContentType": body.content_type},
+            ExpiresIn=300)
+    finally:
+        client.close()
+    return {"upload_url": url, "object_key": key, "expires_in": 300,
+            "method": "PUT", "headers": {"Content-Type": body.content_type}}
